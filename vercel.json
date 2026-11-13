@@ -1,0 +1,5 @@
+{
+  "rewrites": [
+    { "source": "/", "destination": "/artifactium-v3.html" }
+  ]
+}
