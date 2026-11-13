@@ -108,8 +108,10 @@ async function storePhoto(code, full, thumb) {
 
 async function dropCache() { if (redis) { try { await redis.del(LIST_KEY); } catch {} } }
 
+let READY = false;
 const app = express();
 app.disable('x-powered-by');
+app.get('/', (req, res) => res.json({ name: 'artifactium-backend', ready: READY, photos: R2 ? 'r2' : 'postgres' }));
 app.use(express.json({ limit: '15mb' }));
 app.use((req, res, next) => {
   res.set('Access-Control-Allow-Origin', '*');
@@ -118,6 +120,7 @@ app.use((req, res, next) => {
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
+app.use('/api', (req, res, next) => READY ? next() : res.status(503).json({ error: 'starting up' }));
 
 app.get('/health', async (req, res) => {
   let db = false;
@@ -204,6 +207,8 @@ app.get('/api/photos/:id/:size', async (req, res) => {
   } catch (e) { console.error(e); res.sendStatus(500); }
 });
 
-init()
-  .then(() => app.listen(PORT, () => console.log(`artifactium backend on ${PORT}`)))
-  .catch(e => { console.error('init failed', e); process.exit(1); });
+app.listen(PORT, '0.0.0.0', () => console.log(`artifactium backend on ${PORT}`));
+(async function boot(tries = 0) {
+  try { await init(); READY = true; console.log('database ready'); }
+  catch (e) { console.error('init failed, retrying', e.message); setTimeout(() => boot(tries + 1), Math.min(30000, 2000 * (tries + 1))); }
+})();
