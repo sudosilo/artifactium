@@ -5,10 +5,15 @@ import express from 'express';
 import pg from 'pg';
 import { createClient } from 'redis';
 import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
+import { createHash } from 'crypto';
 
 const PORT = process.env.PORT || 8080;
 const DB_URL = process.env.DATABASE_URL;
 const LIST_KEY = 'artifactium:list:v1';
+// Supabase handles contributor sign in. The URL and publishable key are public values.
+const SB_URL = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
+const SB_KEY = process.env.SUPABASE_ANON_KEY || '';
+const AUTH_ON = !!(SB_URL && SB_KEY);
 
 const pool = new pg.Pool({
   connectionString: DB_URL,
@@ -55,6 +60,14 @@ async function init() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     CREATE INDEX IF NOT EXISTS contributions_code ON contributions(code);
+    CREATE TABLE IF NOT EXISTS contributors (
+      user_id TEXT PRIMARY KEY,
+      email TEXT,
+      handle TEXT NOT NULL,
+      role TEXT NOT NULL DEFAULT 'finder',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS contributors_handle_lower ON contributors (lower(handle));
     CREATE TABLE IF NOT EXISTS counters (
       fam TEXT PRIMARY KEY,
       n INTEGER NOT NULL
@@ -106,16 +119,54 @@ async function storePhoto(code, full, thumb) {
   return rows[0].id;
 }
 
+const ROLES = ['finder', 'picker', 'engineer', 'tracer', 'maker', 'fashion'];
+const HANDLE_RE = /^[A-Za-z0-9_]{3,24}$/;
+
+async function userFrom(req) {
+  if (!AUTH_ON) return null;
+  const h = req.get('authorization') || '';
+  const token = h.startsWith('Bearer ') ? h.slice(7).trim() : '';
+  if (!token) return null;
+  const key = 'artifactium:tok:' + createHash('sha256').update(token).digest('hex');
+  if (redis && redis.isReady) {
+    try { const hit = await redis.get(key); if (hit) return JSON.parse(hit); } catch {}
+  }
+  try {
+    const r = await fetch(`${SB_URL}/auth/v1/user`, { headers: { apikey: SB_KEY, Authorization: `Bearer ${token}` } });
+    if (!r.ok) return null;
+    const u = await r.json();
+    if (!u || !u.id) return null;
+    const user = { id: u.id, email: u.email || '' };
+    if (redis && redis.isReady) { try { await redis.set(key, JSON.stringify(user), { EX: 300 }); } catch {} }
+    return user;
+  } catch (e) { console.error('auth check', e.message); return null; }
+}
+
+async function profileOf(userId) {
+  const { rows } = await pool.query('SELECT user_id, handle, role, created_at FROM contributors WHERE user_id = $1', [userId]);
+  return rows[0] || null;
+}
+
+// Writes need a signed in contributor with a handle once Supabase is configured.
+async function needContributor(req, res) {
+  if (!AUTH_ON) return { anon: true };
+  const user = await userFrom(req);
+  if (!user) { res.status(401).json({ error: 'sign in' }); return null; }
+  const profile = await profileOf(user.id);
+  if (!profile) { res.status(403).json({ error: 'pick a handle' }); return null; }
+  return { user, profile };
+}
+
 async function dropCache() { if (redis) { try { await redis.del(LIST_KEY); } catch {} } }
 
 let READY = false;
 const app = express();
 app.disable('x-powered-by');
-app.get('/', (req, res) => res.json({ name: 'artifactium-backend', ready: READY, photos: R2 ? 'r2' : 'postgres' }));
+app.get('/', (req, res) => res.json({ name: 'artifactium-backend', ready: READY, photos: R2 ? 'r2' : 'postgres', auth: AUTH_ON }));
 app.use(express.json({ limit: '15mb' }));
 app.use((req, res, next) => {
   res.set('Access-Control-Allow-Origin', '*');
-  res.set('Access-Control-Allow-Headers', 'Content-Type');
+  res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   res.set('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
@@ -125,7 +176,40 @@ app.use('/api', (req, res, next) => READY ? next() : res.status(503).json({ erro
 app.get('/health', async (req, res) => {
   let db = false;
   try { await pool.query('SELECT 1'); db = true; } catch {}
-  res.json({ ok: db, db, redis: !!(redis && redis.isReady), photos: R2 ? 'r2' : 'postgres' });
+  res.json({ ok: db, db, redis: !!(redis && redis.isReady), photos: R2 ? 'r2' : 'postgres', auth: AUTH_ON });
+});
+
+app.get('/api/config', (req, res) => res.json({ supabaseUrl: SB_URL, supabaseKey: SB_KEY, auth: AUTH_ON }));
+
+app.get('/api/me', async (req, res) => {
+  const user = await userFrom(req);
+  if (!user) return res.status(401).json({ error: 'sign in' });
+  res.json({ user: { email: user.email }, profile: await profileOf(user.id) });
+});
+
+app.post('/api/me', async (req, res) => {
+  const user = await userFrom(req);
+  if (!user) return res.status(401).json({ error: 'sign in' });
+  const handle = String((req.body || {}).handle || '').trim();
+  const role = ROLES.includes((req.body || {}).role) ? req.body.role : 'finder';
+  if (!HANDLE_RE.test(handle)) return res.status(400).json({ error: 'Handles use letters, numbers and underscores, between three and twenty four characters.' });
+  try {
+    await pool.query(
+      `INSERT INTO contributors (user_id, email, handle, role) VALUES ($1, $2, $3, $4)
+       ON CONFLICT (user_id) DO UPDATE SET handle = EXCLUDED.handle, role = EXCLUDED.role`,
+      [user.id, user.email, handle, role]);
+    res.json({ profile: await profileOf(user.id) });
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ error: 'That handle is taken.' });
+    console.error(e); res.status(500).json({ error: 'save failed' });
+  }
+});
+
+app.get('/api/contributors/:handle', async (req, res) => {
+  const { rows } = await pool.query('SELECT handle, role, created_at FROM contributors WHERE lower(handle) = lower($1)', [req.params.handle]);
+  if (!rows.length) return res.status(404).json({ error: 'not found' });
+  const n = await pool.query(`SELECT count(*)::int AS n FROM contributions WHERE data->>'handle' = $1`, [rows[0].handle]);
+  res.json({ profile: rows[0], contributions: n.rows[0].n });
 });
 
 app.get('/api/specimens', async (req, res) => {
@@ -151,6 +235,8 @@ app.get('/api/specimens/:code', async (req, res) => {
 
 app.post('/api/specimens', async (req, res) => {
   try {
+    const who = await needContributor(req, res);
+    if (!who) return;
     const { record, fam, photo, thumb } = req.body || {};
     if (!FAM_RE.test(fam || '')) return res.status(400).json({ error: 'bad family' });
     const full = decodeImage(photo, 6 * 1024 * 1024);
@@ -164,6 +250,7 @@ app.post('/api/specimens', async (req, res) => {
       r.photoFull = `/api/photos/${id}/full`;
     }
     if (!r.logged) r.logged = new Date().toISOString().slice(0, 10);
+    if (who.profile) r.loggedBy = who.profile.handle;
     await pool.query('INSERT INTO specimens (code, data) VALUES ($1, $2)', [code, r]);
     await dropCache();
     res.json({ record: r });
@@ -174,12 +261,15 @@ app.post('/api/specimens/:code/contributions', async (req, res) => {
   try {
     const code = req.params.code;
     if (!CODE_RE.test(code)) return res.status(400).json({ error: 'bad code' });
+    const who = await needContributor(req, res);
+    if (!who) return;
     const { contribution, record } = req.body || {};
     const c = contribution || {};
     const note = { role: clip(c.role, 40), handle: clip(c.handle, 60) || 'anonymous', text: clip(c.text, 2000), target: clip(c.target, 80) };
+    if (who.profile) { note.handle = who.profile.handle; note.user_id = who.user.id; }
     const r = cleanRecord(record, code);
     const old = await pool.query('SELECT data FROM specimens WHERE code = $1', [code]);
-    if (old.rows.length) { r.photo = old.rows[0].data.photo; r.photoFull = old.rows[0].data.photoFull; if (!r.photo) { delete r.photo; delete r.photoFull; } }
+    if (old.rows.length) { const o = old.rows[0].data; r.photo = o.photo; r.photoFull = o.photoFull; if (!r.photo) { delete r.photo; delete r.photoFull; } if (o.loggedBy) r.loggedBy = o.loggedBy; else delete r.loggedBy; }
     await pool.query(
       `INSERT INTO specimens (code, data) VALUES ($1, $2)
        ON CONFLICT (code) DO UPDATE SET data = EXCLUDED.data, updated_at = now()`, [code, r]);
